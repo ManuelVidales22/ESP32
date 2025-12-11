@@ -1,12 +1,6 @@
 #include "esp_camera.h"
 #include <WiFi.h>
-#include <WebServer.h>
 #include <HTTPClient.h>
-// IP y ruta del servidor en la Raspberry Pi
-#define RASPBERRY_SERVER "http://10.70.100.191:5000/upload"
-
-unsigned long lastSend = 0;
-const unsigned long sendInterval = 10000; // 10 segundos
 
 // === CONFIGURACIÓN DE PINES ===
 #define PWDN_GPIO_NUM     -1
@@ -28,167 +22,256 @@ const unsigned long sendInterval = 10000; // 10 segundos
 #define PCLK_GPIO_NUM     13
 
 // === CONFIGURACIÓN WIFI ===
-const char* ssid = "redmi-note";      // CAMBIA por tu WiFi
-const char* password = "124abcjeje";   // CAMBIA por tu password
+const char* ssid = "redmi-note";
+const char* password = "124abcjeje";
+#define RASPBERRY_SERVER "http://10.95.16.191:5000"
 
-WebServer server(80);
+unsigned long lastCapture = 0;
+unsigned long interval = 300000; // 5 minutos por defecto
 
-// DECLARAR LAS FUNCIONES ANTES de setup()
-void handleRoot();
-void handleCapture();
-void handleStream();
+void setupCamera() {
+  camera_config_t config;
+  
+  // Configuración con tus pines que funcionan
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;      // 11
+  config.pin_d1 = Y3_GPIO_NUM;      // 9
+  config.pin_d2 = Y4_GPIO_NUM;      // 8
+  config.pin_d3 = Y5_GPIO_NUM;      // 10
+  config.pin_d4 = Y6_GPIO_NUM;      // 12
+  config.pin_d5 = Y7_GPIO_NUM;      // 18
+  config.pin_d6 = Y8_GPIO_NUM;      // 17
+  config.pin_d7 = Y9_GPIO_NUM;      // 16
+  config.pin_xclk = XCLK_GPIO_NUM;  // 15
+  config.pin_pclk = PCLK_GPIO_NUM;  // 13
+  config.pin_vsync = VSYNC_GPIO_NUM;// 6
+  config.pin_href = HREF_GPIO_NUM;  // 7
+  config.pin_sccb_sda = SIOD_GPIO_NUM;  // 4
+  config.pin_sccb_scl = SIOC_GPIO_NUM;  // 5
+  config.pin_pwdn = PWDN_GPIO_NUM;  // -1
+  config.pin_reset = RESET_GPIO_NUM;// -1
+  
+  config.xclk_freq_hz = 10000000;  // 10MHz, más bajo para estabilidad
+  config.pixel_format = PIXFORMAT_JPEG;
+  
+  // Configuración para ESP32-S3 sin PSRAM
+  config.frame_size = FRAMESIZE_VGA;  // 640x480 (más estable que SVGA sin PSRAM)
+  config.jpeg_quality = 12;           // Calidad media-baja
+  config.fb_count = 1;                // Solo un buffer
+  
+  // CONFIGURACIÓN CRÍTICA: Usar DRAM, no PSRAM
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_DRAM;  // ¡IMPORTANTE! Sin PSRAM
+  
+  Serial.println("Inicializando cámara con pines conocidos...");
+  
+  // Inicializar cámara
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    
+    // Intenta con configuración más reducida
+    Serial.println("Probando con resolución más baja...");
+    config.frame_size = FRAMESIZE_QVGA;  // 320x240
+    config.jpeg_quality = 15;
+    config.xclk_freq_hz = 8000000;  // 8MHz
+    
+    err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+      Serial.printf("Configuración alternativa también falló: 0x%x\n", err);
+      Serial.println("La cámara no funcionará, pero continuamos con WiFi...");
+      return;
+    }
+  }
+  
+  Serial.println("Cámara inicializada correctamente");
+  
+  // Obtener información del sensor
+  sensor_t *s = esp_camera_sensor_get();
+  if (s != NULL) {
+    Serial.printf("Sensor detectado: PID=%04X, VER=%04X\n", 
+                  s->id.PID, s->id.VER);
+    
+    // Configuración básica del sensor para mejor calidad
+    s->set_brightness(s, 0);      // Brillo
+    s->set_contrast(s, 0);        // Contraste
+    s->set_saturation(s, 0);      // Saturación
+    s->set_whitebal(s, 1);        // Balance de blancos automático
+    s->set_gain_ctrl(s, 1);       // Control de ganancia automático
+    s->set_exposure_ctrl(s, 1);   // Control de exposición automático
+    s->set_hmirror(s, 0);         // Espejo horizontal
+    s->set_vflip(s, 0);           // Volteo vertical
+  }
+}
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("🚀 Iniciando cámara ESP32-S3...");
-
-  // Configuración de cámara
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 10000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_VGA;  // 160x120 (funciona sin PSRAM)
-  config.jpeg_quality = 10;
-  config.fb_count = 1;
-  config.fb_location = CAMERA_FB_IN_DRAM;  // Sin PSRAM
-
-  // Inicializar cámara
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("❌ Error cámara: 0x%x\n", err);
-    return;
-  }
-
-  Serial.println("✅ Cámara inicializada!");
-
-  // Conectar WiFi
+  Serial.println("=== ESP32-S3 Camera con pines conocidos ===");
+  
+  // Primero inicializar la cámara
+  setupCamera();
+  
+  Serial.println("Conectando a WiFi...");
   WiFi.begin(ssid, password);
-  Serial.print("📡 Conectando a WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     Serial.print(".");
+    attempts++;
   }
-  Serial.println("\n✅ WiFi conectado!");
-  Serial.print("🌐 IP: ");
-  Serial.println(WiFi.localIP());
-
-  // Configurar rutas del servidor
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/capture", HTTP_GET, handleCapture);
-  server.on("/stream", HTTP_GET, handleStream);
   
-  server.begin();
-  Serial.println("🚀 Servidor web iniciado!");
-  Serial.println("📸 Ve a http://" + WiFi.localIP().toString() + " en tu navegador");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi conectado");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFallo en conexión WiFi");
+    // Continuamos sin WiFi
+  }
 }
 
-void handleRoot() {
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<title>ESP32-CAM</title>";
-  html += "<meta charset='UTF-8'>";
-  html += "<style>";
-  html += "body { font-family: Arial; text-align: center; margin: 20px; }";
-  html += "button { padding: 10px 20px; font-size: 16px; margin: 10px; }";
-  html += "img { max-width: 90%; border: 2px solid #333; margin: 10px; }";
-  html += "</style></head><body>";
-  html += "<h1>📸 ESP32-S3 Cámara</h1>";
-  html += "<button onclick='capture()'>📷 Capturar Foto</button>";
-  html += "<button onclick='stream()'>🎥 Ver Stream</button>";
-  html += "<div id='image'></div>";
-  html += "<script>";
-  html += "function capture() {";
-  html += "  document.getElementById('image').innerHTML = '<img src=\"/capture\" />';";
-  html += "}";
-  html += "function stream() {";
-  html += "  document.getElementById('image').innerHTML = '<img src=\"/stream\" />';";
-  html += "}";
-  html += "</script>";
-  html += "</body></html>";
+bool query_fast_mode() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi no conectado, modo normal");
+    return false;
+  }
   
-  server.send(200, "text/html", html);
+  HTTPClient http;
+  String url = String(RASPBERRY_SERVER) + "/mode";
+  http.begin(url);
+  http.setTimeout(5000);
+  
+  int code = http.GET();
+  bool result = false;
+  
+  if (code == 200) {
+    String s = http.getString();
+    result = (s.indexOf("true") >= 0);
+    Serial.printf("Modo rápido: %s\n", result ? "activado" : "desactivado");
+  } else {
+    Serial.printf("Error al consultar modo: %d\n", code);
+  }
+  
+  http.end();
+  return result;
 }
 
-void handleCapture() {
-  Serial.println("📸 Capturando foto...");
-  camera_fb_t *fb = esp_camera_fb_get();
+void send_photo(uint8_t *buf, size_t len) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi no conectado, no se puede enviar foto");
+    return;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+
+  String url = String(RASPBERRY_SERVER) + "/upload";
+  http.begin(client, url);
+
+  String boundary = "------------------------abcd1234";
+  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+
+  // Partes del multipart
+  String head =
+    "--" + boundary + "\r\n"
+    "Content-Disposition: form-data; name=\"image\"; filename=\"cam.jpg\"\r\n"
+    "Content-Type: image/jpeg\r\n\r\n";
+
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  // Calcular longitud total
+  size_t totalLength = head.length() + len + tail.length();
   
-  if (!fb) {
-    server.send(500, "text/plain", "Error capturando foto");
+  // Crear el cuerpo completo del mensaje
+  uint8_t *fullBody = (uint8_t*)malloc(totalLength);
+  if (!fullBody) {
+    Serial.println("Error: no se pudo asignar memoria para el cuerpo");
+    http.end();
     return;
   }
   
-  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
-  Serial.printf("✅ Foto enviada: %u bytes\n", fb->len);
+  // Copiar todas las partes al buffer
+  memcpy(fullBody, head.c_str(), head.length());
+  memcpy(fullBody + head.length(), buf, len);
+  memcpy(fullBody + head.length() + len, tail.c_str(), tail.length());
   
-  esp_camera_fb_return(fb);
-}
-
-void handleStream() {
-  String response = "HTTP/1.1 200 OK\r\n";
-  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  // Enviar POST con todos los datos
+  int httpResponseCode = http.POST(fullBody, totalLength);
   
-  server.sendContent(response);
+  // Liberar memoria
+  free(fullBody);
   
-  while (true) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) break;
+  if (httpResponseCode > 0) {
+    Serial.printf("POST enviado. Código de respuesta: %d\n", httpResponseCode);
     
-    response = "--frame\r\n";
-    response += "Content-Type: image/jpeg\r\n\r\n";
-    server.sendContent(response);
-    server.sendContent_P((const char*)fb->buf, fb->len);
-    server.sendContent("\r\n");
-    
-    esp_camera_fb_return(fb);
-    delay(100);
+    if (httpResponseCode == 200) {
+      String response = http.getString();
+      Serial.println("Respuesta del servidor:");
+      Serial.println(response);
+    }
+  } else {
+    Serial.printf("Error en POST: %s\n", http.errorToString(httpResponseCode).c_str());
   }
+
+  http.end();
 }
 
 void loop() {
-  server.handleClient();
-
-  unsigned long now = millis();
-  if (now - lastSend > sendInterval) {
-    lastSend = now;
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb) {
-      if ((WiFi.status() == WL_CONNECTED)) {
-        HTTPClient http;
-        http.begin(RASPBERRY_SERVER);
-        http.addHeader("Content-Type", "image/jpeg");
-        int httpResponseCode = http.POST(fb->buf, fb->len);
-        if (httpResponseCode > 0) {
-          Serial.printf("✅ Imagen enviada a Raspberry Pi! Código: %d\n", httpResponseCode);
-        } else {
-          Serial.printf("❌ Error enviando imagen: %s\n", http.errorToString(httpResponseCode).c_str());
-        }
-        http.end();
-      } else {
-        Serial.println("❌ WiFi no conectado, no se pudo enviar la imagen");
-      }
-      esp_camera_fb_return(fb);
-    } else {
-      Serial.println("❌ Error capturando foto para enviar");
+  // Verificar WiFi cada 30 segundos
+  static unsigned long lastWifiCheck = 0;
+  if (millis() - lastWifiCheck > 30000) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Reconectando WiFi...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+      delay(2000);
     }
+    lastWifiCheck = millis();
   }
-  delay(2);
+  
+  // Consultar modo (solo si hay WiFi)
+  bool fast = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    fast = query_fast_mode();
+  }
+  
+  // Ajustar intervalo
+  interval = fast ? 10000 : 300000; // 10s o 5min
+  
+  unsigned long now = millis();
+  if (now - lastCapture >= interval) {
+    Serial.println("Intentando capturar foto...");
+    
+    // Verificar si la cámara está inicializada
+    if (esp_camera_sensor_get() == NULL) {
+      Serial.println("Cámara no disponible");
+    } else {
+      // Tomar foto
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (!fb) {
+        Serial.println("Error al capturar foto");
+      } else {
+        Serial.printf("Foto capturada: %d bytes\n", fb->len);
+        
+        if (fb->len > 100) {
+          // Mostrar información de la foto
+          Serial.printf("Ancho: %d, Alto: %d, Formato: %d\n", 
+                       fb->width, fb->height, fb->format);
+          send_photo(fb->buf, fb->len);
+        } else {
+          Serial.println("Foto demasiado pequeña, posible error");
+          Serial.printf("Bytes recibidos: %d\n", fb->len);
+        }
+        
+        esp_camera_fb_return(fb);
+      }
+    }
+    lastCapture = now;
+  }
+  
+  delay(1000);
 }
